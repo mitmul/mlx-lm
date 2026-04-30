@@ -3,7 +3,9 @@ from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerFast
+
+from .plamo3_tokenizer import Plamo3Config, Plamo3Tokenizer
 
 
 class StreamingDetokenizer:
@@ -374,6 +376,10 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
 
 
 AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+AutoConfig.register("plamo3", Plamo3Config, exist_ok=True)
+AutoTokenizer.register(
+    Plamo3Config, slow_tokenizer_class=Plamo3Tokenizer, exist_ok=True
+)
 
 
 def _match(a, b):
