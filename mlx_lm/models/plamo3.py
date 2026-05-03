@@ -23,7 +23,7 @@ class ModelArgs(BaseModelArgs):
     head_dim: int = 128
     max_position_embeddings: int = 2048
     window_size: int = 2048
-    sliding_window: Optional[int] = None
+    sliding_window: Optional[Any] = None
     sliding_window_pattern: int = 8
     rope_theta: float = 1_000_000
     rope_local_theta: float = 10_000
@@ -35,8 +35,12 @@ class ModelArgs(BaseModelArgs):
     linear_type: str = "normal"
 
     def __post_init__(self):
-        if self.sliding_window is not None:
+        if isinstance(self.sliding_window, int):
             self.window_size = self.sliding_window
+        elif isinstance(self.sliding_window, list):
+            windows = [w for w in self.sliding_window if w is not None]
+            if windows:
+                self.window_size = windows[0]
 
 
 def is_full_attention(args: ModelArgs, layer_idx: int) -> bool:
