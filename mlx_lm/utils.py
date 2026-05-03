@@ -35,7 +35,13 @@ else:
 # For large models with lots of files
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import (
+    tree_flatten,
+    tree_map,
+    tree_map_with_path,
+    tree_reduce,
+    tree_unflatten,
+)
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
@@ -55,6 +61,36 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+
+
+class NVFP4ScaledLinear(nn.QuantizedLinear):
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        bias: bool = True,
+        group_size: int = None,
+        bits: int = None,
+        mode: str = "nvfp4",
+    ):
+        super().__init__(input_dims, output_dims, bias, group_size, bits, mode)
+        self.weight_global_scale = mx.ones((1,), dtype=mx.float32)
+
+    def __call__(self, x):
+        x = mx.quantized_matmul(
+            x,
+            self["weight"],
+            scales=self["scales"],
+            biases=self.get("biases"),
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        x = x / self["weight_global_scale"]
+        if "bias" in self:
+            x = x + self["bias"]
+        return x
 
 
 def _parse_size(x):
@@ -169,6 +205,74 @@ def _transform_awq_weights(
         "bits": bits,
     }
 
+    return new_weights, mlx_quantization
+
+
+def _is_nvfp4_compressed_tensors(quantization_config: Dict[str, Any]) -> bool:
+    if quantization_config.get("format") == "nvfp4-pack-quantized":
+        return True
+    config_groups = quantization_config.get("config_groups", {})
+    return any(
+        group.get("format") == "nvfp4-pack-quantized"
+        for group in config_groups.values()
+        if isinstance(group, dict)
+    )
+
+
+def _get_nvfp4_group_size(quantization_config: Dict[str, Any]) -> int:
+    config_groups = quantization_config.get("config_groups", {})
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        weights_config = group.get("weights", {})
+        if isinstance(weights_config, dict) and "group_size" in weights_config:
+            return weights_config["group_size"]
+    return 16
+
+
+def _transform_nvfp4_compressed_tensors_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    group_size = _get_nvfp4_group_size(quantization_config)
+    if group_size != 16:
+        raise ValueError(
+            "Only group_size=16 is supported for compressed-tensors NVFP4 models."
+        )
+
+    new_weights = {}
+    for key, weight in weights.items():
+        if key.endswith(".weight_packed"):
+            prefix = key[: -len(".weight_packed")]
+            if weight.dtype != mx.uint8:
+                raise ValueError(
+                    f"Expected {key} to have uint8 dtype, got {weight.dtype}."
+                )
+            if weight.shape[-1] % 4:
+                raise ValueError(
+                    f"Expected the last dimension of {key} to be divisible by 4, "
+                    f"got {weight.shape[-1]}."
+                )
+            new_weights[f"{prefix}.weight"] = mx.view(mx.contiguous(weight), mx.uint32)
+        elif key.endswith(".weight_scale"):
+            prefix = key[: -len(".weight_scale")]
+            new_weights[f"{prefix}.scales"] = weight
+        elif key.endswith(".weight_global_scale"):
+            prefix = key[: -len(".weight_global_scale")]
+            new_weights[f"{prefix}.weight_global_scale"] = mx.max(
+                weight, keepdims=True
+            )
+        elif key.endswith(".input_global_scale"):
+            continue
+        else:
+            new_weights[key] = weight
+
+    mlx_quantization = {
+        "group_size": group_size,
+        "bits": 4,
+        "mode": "nvfp4",
+        "weight_global_scale": True,
+    }
     return new_weights, mlx_quantization
 
 
@@ -362,6 +466,31 @@ def load_model(
             class_predicate=class_predicate,
         )
 
+        if quantization.get("weight_global_scale", False):
+
+            def _maybe_scaled_linear(p, m):
+                if (
+                    isinstance(m, nn.QuantizedLinear)
+                    and f"{p}.weight_global_scale" in weights
+                ):
+                    out_dims, in_dims = m.weight.shape
+                    in_dims *= 32 // m.bits
+                    return NVFP4ScaledLinear(
+                        in_dims,
+                        out_dims,
+                        bias="bias" in m,
+                        group_size=m.group_size,
+                        bits=m.bits,
+                        mode=m.mode,
+                    )
+                return m
+
+            leaves = model.leaf_modules()
+            leaves = tree_map_with_path(
+                _maybe_scaled_linear, leaves, is_leaf=nn.Module.is_module
+            )
+            model.update_modules(leaves)
+
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)
 
@@ -378,7 +507,12 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            if _is_nvfp4_compressed_tensors(quantization_config):
+                weights, quantization = _transform_nvfp4_compressed_tensors_weights(
+                    weights, quantization_config
+                )
+            else:
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)

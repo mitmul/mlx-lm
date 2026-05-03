@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import json
 import os
 import tempfile
 import unittest
@@ -182,6 +183,148 @@ class TestUtils(unittest.TestCase):
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+    def test_transform_nvfp4_compressed_tensors_weights(self):
+        weight = mx.random.normal(shape=(32, 64))
+        qweight, scales = mx.quantize(weight, group_size=16, bits=4, mode="nvfp4")
+        packed = mx.view(qweight, mx.uint8)
+
+        weights, quantization = utils._transform_nvfp4_compressed_tensors_weights(
+            {
+                "model.layers.0.mlp.down_proj.weight_packed": packed,
+                "model.layers.0.mlp.down_proj.weight_scale": scales,
+                "model.layers.0.mlp.down_proj.weight_global_scale": mx.array(
+                    [2.0], dtype=mx.float32
+                ),
+                "model.layers.0.mlp.down_proj.input_global_scale": mx.array(
+                    [3.0], dtype=mx.float32
+                ),
+            },
+            {
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"group_size": 16},
+                    },
+                },
+            },
+        )
+
+        mx.eval(weights)
+        self.assertTrue(
+            mx.array_equal(
+                weights["model.layers.0.mlp.down_proj.weight"],
+                qweight,
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights["model.layers.0.mlp.down_proj.scales"],
+                scales,
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights["model.layers.0.mlp.down_proj.weight_global_scale"],
+                mx.array([2.0], dtype=mx.float32),
+            )
+        )
+        self.assertNotIn(
+            "model.layers.0.mlp.down_proj.input_global_scale",
+            weights,
+        )
+        self.assertEqual(
+            quantization,
+            {
+                "group_size": 16,
+                "bits": 4,
+                "mode": "nvfp4",
+                "weight_global_scale": True,
+            },
+        )
+
+    def test_load_model_with_nvfp4_compressed_tensors(self):
+        from mlx_lm.models import plamo3
+
+        config = {
+            "model_type": "plamo3",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 32,
+            "tie_word_embeddings": True,
+            "sliding_window": None,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "nvfp4-pack-quantized",
+                        "targets": ["Linear"],
+                        "weights": {
+                            "num_bits": 4,
+                            "group_size": 16,
+                            "type": "float",
+                        },
+                    },
+                },
+            },
+        }
+
+        args = plamo3.ModelArgs.from_dict(config)
+        model = plamo3.Model(args)
+        weights = {}
+        for key, value in tree_flatten(model.parameters()):
+            if (
+                key.endswith(".weight")
+                and value.ndim == 2
+                and key != "model.embed_tokens.weight"
+            ):
+                prefix = key[: -len(".weight")]
+                qweight, scales = mx.quantize(
+                    value, group_size=16, bits=4, mode="nvfp4"
+                )
+                weights[f"{prefix}.weight_packed"] = mx.view(qweight, mx.uint8)
+                weights[f"{prefix}.weight_scale"] = scales
+                weights[f"{prefix}.weight_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+                weights[f"{prefix}.input_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+            else:
+                weights[key] = value
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as model_path:
+            with open(os.path.join(model_path, "config.json"), "w") as f:
+                json.dump(config, f)
+            mx.save_safetensors(
+                os.path.join(model_path, "model.safetensors"),
+                weights,
+                metadata={"format": "pt"},
+            )
+
+            loaded, loaded_config = utils.load_model(Path(model_path), lazy=True)
+            self.assertIsInstance(
+                loaded.layers[0].mixer.o_proj,
+                utils.NVFP4ScaledLinear,
+            )
+            self.assertEqual(
+                loaded_config["quantization"],
+                {
+                    "group_size": 16,
+                    "bits": 4,
+                    "mode": "nvfp4",
+                    "weight_global_scale": True,
+                },
+            )
+
+            logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, config["vocab_size"]))
 
 
 if __name__ == "__main__":
